@@ -1,0 +1,16 @@
+{
+  "name": "sqlite-graph-rag",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Graph RAG in a local SQLite file: hybrid vector + FTS5 retrieval fused by RRF, then expansion along a typed edge table. Works with no embedder and no network.",
+  "main": "src/index.ts",
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "devDependencies": {
+    "better-sqlite3": "^12.2.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.7.0"
+  }
+}
