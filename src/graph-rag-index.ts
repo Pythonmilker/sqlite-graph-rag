@@ -53,8 +53,8 @@ export interface GraphContext {
 
 export interface GraphRagOptions {
   db: SqliteDb;
-  /** null/omitted → KEYWORD-ONLY mode: FTS5 bm25 (+ graph expansion) with no vector leg — for engines
-   *  with no embedder (hosted/anthropic). Rows persist with no embedding; FTS + edges work identically. */
+  /** null/omitted → KEYWORD-ONLY mode: FTS5 bm25 (+ graph expansion) with no vector leg
+   *  Rows persist with no embedding; FTS + edges work identically. */
   embedder?: Embedder | null;
   scopeId: string;
   /** label stored alongside each vector (the embedder model). */

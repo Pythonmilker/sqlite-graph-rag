@@ -22,7 +22,7 @@ const CHARS_PER_TOKEN = 4;
 // CJK / Japanese / Korean / fullwidth codepoints tokenize at roughly 1–2.5 REAL tokens EACH — the opposite
 // of the ~4-Latin-chars-per-token assumption. A token *ceiling* that under-reports is worse than useless
 // (it lets a non-Latin corpus blow the budget while reading "under" it), so we weight these at 2 to
-// deliberately OVER-count rather than under-count. Kept in lockstep with the hosted proxy's estInputTokens.
+// deliberately OVER-count rather than under-count.
 const WIDE_CHAR = /[ᄀ-ᇿ　-〿぀-ヿ㐀-䶿一-鿿가-힯豈-﫿＀-￯]/g;
 
 /** Cheap, tokenizer-free, SCRIPT-AWARE token estimate. Latin ≈ 4 chars/token; CJK/JP/KR ≈ 2 tokens/char

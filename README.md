@@ -32,6 +32,27 @@ This is a supported mode rather than a fallback. It is why the whole thing runs 
 network, and it is worth knowing that graph expansion is where a keyword-only setup gets most of its
 apparent intelligence.
 
+## What you bring
+
+This is the retrieval middle of a RAG pipeline. Four things come from the host application, and the
+library stops one step short of the model:
+
+- **Records**, as plain objects in named collections, described by `SourceSpec`s. A collection no
+  spec names is never indexed, and that absence is a guarantee the tests pin.
+- **The `edges` table**, if you want expansion. The host owns it and writes it; this library only
+  reads it.
+- **An embedder, optionally** — anything shaped `embed(texts: string[]) => Promise<number[][]>`, one
+  vector per input. The product this was extracted from injects a small static Model2Vec model that
+  runs on-device; the tests inject a deterministic hashing embedder; a hosted embeddings endpoint has
+  the same shape. Vectors from different models share no space, so changing models means `clear()`
+  and re-indexing — the `model` label stored on every node exists to catch exactly that.
+- **A SQLite connection**, through the four-method interface in `src/sqlite.ts`. An adapter for
+  better-sqlite3 is included.
+
+Where it stops: `retrieveContext` returns seeds plus their neighbours, and `buildContext` renders
+them into a token-budgeted prompt block. Calling a model with that block, and everything after,
+belongs to the host.
+
 ## Example
 
 ```ts

@@ -39,7 +39,7 @@ describe('salience rides its own column, not the prose', () => {
     expect(byId.get('c')).toBe('notable'); // omitted ⇒ the default
   });
 
-  it('the tier is NOT searchable text — the free tier runs on FTS alone, and a label would match itself', async () => {
+  it('the tier is NOT searchable text — keyword-only mode runs on FTS alone, and a label would match itself', async () => {
     await lg.indexNodes([{ id: 'a', kind: 'place', title: 'Payments API', body: 'runs the nightly charge batch', salience: 'defining' }]);
     expect(await lg.search('defining')).toHaveLength(0);
     expect(await lg.search('incidental')).toHaveLength(0);
