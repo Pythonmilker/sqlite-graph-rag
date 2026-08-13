@@ -97,15 +97,15 @@ describe('remembered details are their own retrievable nodes', () => {
     expect((await lg.search('retries'))[0].title).toBe('Payments API');
   });
 
-  it('detailNodeIdsOf lists exactly one record’s details — the set the pruner diffs against', async () => {
+  it('childNodeIdsOf lists exactly one record’s details — the set the pruner diffs against', async () => {
     await lg.indexNodes([
       { id: 'p#d1', kind: 'detail', title: 'A', body: 'one' },
       { id: 'p#d2', kind: 'detail', title: 'A', body: 'two' },
       { id: 'q#d1', kind: 'detail', title: 'B', body: 'three' },
       { id: 'p', kind: 'place', title: 'A', body: 'the place itself' },
     ]);
-    expect(lg.detailNodeIdsOf('p').sort()).toEqual(['p#d1', 'p#d2']);
-    expect(lg.detailNodeIdsOf('q')).toEqual(['q#d1']);
+    expect(lg.childNodeIdsOf('p').sort()).toEqual(['p#d1', 'p#d2']);
+    expect(lg.childNodeIdsOf('q')).toEqual(['q#d1']);
   });
 
   it('a REMOVED detail stops being retrievable — a deleted fact that still surfaces is worse than no memory', async () => {
@@ -113,7 +113,7 @@ describe('remembered details are their own retrievable nodes', () => {
     expect(await lg.search('retries')).toHaveLength(1);
     lg.removeNode('p#d1');
     expect(await lg.search('retries')).toHaveLength(0);
-    expect(lg.detailNodeIdsOf('p')).toEqual([]);
+    expect(lg.childNodeIdsOf('p')).toEqual([]);
   });
 
   it('details never claim a guaranteed name-seed — they borrow the parent’s title and would flood it', async () => {
@@ -212,13 +212,15 @@ describe('the context block carries the tier to the model', () => {
     }
   });
 
-  it('a graph neighbour carries no tier and is ranked as the default, not invented', () => {
+  it('a graph neighbour carries its OWN tier through expansion — the tag and trim priority survive', () => {
+    // The regression this pins: neighbours used to be hardcoded 'notable', so an incidental fact
+    // reached through an edge lost its tag and outranked the incidental seed that surfaced it.
     const r = buildContext({
       query: 'q',
-      seeds: [hit('1', 'place', 'Seed', 's', 'incidental')],
-      related: [{ id: '2', title: 'Neighbour', kind: 'entity', relation: 'lives_in', weight: 1, via: 'e', direction: 'out' }],
+      seeds: [hit('1', 'place', 'Seed', 's', 'notable')],
+      related: [{ id: '2', title: 'Neighbour', kind: 'entity', salience: 'incidental', relation: 'calls', weight: 1, via: 'e', direction: 'out' }],
     });
-    expect(r.text).toContain('- Neighbour [entity]');
-    expect(r.text.indexOf('Neighbour')).toBeLessThan(r.text.indexOf('Seed')); // notable sorts above incidental
+    expect(r.text).toContain('- Neighbour [entity · incidental]');
+    expect(r.text.indexOf('Seed')).toBeLessThan(r.text.indexOf('Neighbour')); // notable seed outranks incidental neighbour
   });
 });

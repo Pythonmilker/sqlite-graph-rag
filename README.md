@@ -95,7 +95,9 @@ CREATE TABLE edges (id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, data TEXT NOT N
 ```
 
 Edges are read fresh on every expansion, so rows written after construction are picked up without
-rebuilding anything.
+rebuilding anything — and the probe for the table itself re-checks until it appears, so a host whose
+migration creates `edges` after this index is constructed loses nothing. Rows whose JSON has the
+wrong shape are skipped the same way malformed JSON is.
 
 Weight rides through expansion untouched instead of folding into the retrieval score. Relevance and
 relatedness are different questions, and collapsing them lets a strongly connected but irrelevant
@@ -113,13 +115,18 @@ than in the indexed text. Two reasons, both found by watching retrieval run:
 It exists because storage and recall are different questions. A fact can be worth keeping and still
 be wrong to volunteer every turn.
 
+Salience survives graph expansion — a neighbour carries its own tier, read from its node row — and
+child facts indexed through a `SourceSpec.children` field default to `incidental` rather than
+`notable`: the point of a remembered annotation is that it stays available without being volunteered,
+and promotion is an explicit act.
+
 ## Run it
 
 Node 20 or newer.
 
 ```bash
 npm install
-npm test          # 55 tests
+npm test          # 63 tests
 npm run typecheck # tsc --noEmit, strict
 ```
 

@@ -13,6 +13,8 @@
  * rather than as a query you have to read carefully.
  */
 
+import { DETAIL_KIND } from './salience';
+
 /** The minimum a stored node has to tell us. */
 export interface NodeRef {
   node_id: string;
@@ -28,13 +30,14 @@ export interface NodeRef {
  * change quietly deletes a corpus's memory. A kind present with an EMPTY set is different and does prune:
  * it means we looked and there is genuinely nothing left.
  *
- * `detail` nodes are not this function's business — they hang off a parent record and are reconciled with
- * their parent (see detailNodeId / keywordReconcile).
+ * Child (`detail`) nodes are not this function's business — they hang off a parent record and are
+ * reconciled with their parent instead (mint ids with `childNodeId`, list what is currently indexed
+ * with `childNodeIdsOf`, remove the difference).
  */
 export function deadNodes(rows: readonly NodeRef[], liveByKind: ReadonlyMap<string, ReadonlySet<string>>): string[] {
   const dead: string[] = [];
   for (const r of rows) {
-    if (r.kind === 'detail') continue;
+    if (r.kind === DETAIL_KIND) continue;
     const live = liveByKind.get(r.kind);
     if (!live) continue; // never enumerated ⇒ never pruned
     if (!live.has(r.node_id)) dead.push(r.node_id);

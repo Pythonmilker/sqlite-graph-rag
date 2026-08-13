@@ -1,9 +1,16 @@
 import type { SqliteDb } from './sqlite';
-import { childNodesFor, asSalience, type ChildFact, type Salience } from './salience';
+import {
+  childNodesFor,
+  childNodeIdPrefix,
+  asSalience,
+  DETAIL_KIND,
+  type ChildFact,
+  type Salience,
+} from './salience';
 
 import { BruteForceIndex, bufferToF32, f32ToBuffer, type VectorIndex } from './vector-index';
 
-/** Duck-typed embedder — pass `AiService.embed` without importing @hub/ai. */
+/** Duck-typed embedder: anything shaped `embed(texts) => Promise<number[][]>`, hosted or local. */
 export interface Embedder {
   embed(texts: string[]): Promise<number[][]>;
 }
@@ -37,6 +44,9 @@ export interface Neighbor {
   id: string;
   title: string;
   kind: string;
+  /** The neighbour's own salience, read from its node row — an incidental fact reached through an
+   *  edge is still incidental, and downstream ranking must see that. */
+  salience: Salience;
   relation: string;
   weight: number;
   /** the GraphEdge id this neighbour was reached through. */
@@ -92,6 +102,9 @@ export interface GraphEdge {
   weight: number;
 }
 
+/** One traversable step of an edge, as stored in the adjacency map (an edge yields two: out and in). */
+type Step = { to: string; relation: string; weight: number; via: string; direction: 'out' | 'in' };
+
 /**
  * How to turn one collection of records into indexable nodes.
  *
@@ -108,12 +121,18 @@ export interface SourceSpec {
   key: string;
   /** Node kind recorded on every node from this collection. */
   kind: string;
+  /** Field holding each record's unique id. Defaults to `id`. A record with no usable id cannot be
+   *  indexed correctly (node ids are UNIQUE with upsert semantics), so a missing one is an error,
+   *  never a silent collapse. */
+  id?: string;
   /** Field to use as the node title. */
   title: string;
   /** Fields concatenated into the indexed body. */
   body: string[];
   decorate?: (record: Record<string, unknown>) => string;
-  /** Field holding `ChildFact[]`. Defaults to `details`. */
+  /** Field holding `ChildFact[]`, indexed as separate child nodes. OPT-IN: leave unset and no child
+   *  expansion happens. There is deliberately no default field name — a library that silently indexes
+   *  everyone's `details` arrays is indexing data nobody offered it. */
   children?: string;
 }
 
@@ -157,7 +176,10 @@ export class GraphRagIndex {
   private readonly model: string;
   private readonly index: VectorIndex;
   private readonly rrfK: number;
-  private readonly hasEdgeTable: boolean;
+  /** Sticky-true probe for the consumer-owned `edges` table. NOT readonly: the host may create the
+   *  table after constructing this index (its migrations run on its own schedule), so a false probe
+   *  is re-checked on use. Snapshotting the first answer forever would silently disable the graph leg. */
+  private hasEdgeTable: boolean;
   private readonly sources: readonly SourceSpec[];
 
   constructor(opts: GraphRagOptions) {
@@ -179,6 +201,13 @@ export class GraphRagIndex {
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
       .get(name);
     return !!row;
+  }
+
+  /** True once `edges` exists, re-probing while false — this is what makes the README's "rows written
+   *  after construction are picked up" true even when the TABLE itself arrives after construction. */
+  private edgeTablePresent(): boolean {
+    if (!this.hasEdgeTable) this.hasEdgeTable = this.tableExists('edges');
+    return this.hasEdgeTable;
   }
 
   /**
@@ -286,41 +315,60 @@ export class GraphRagIndex {
    * stays retrievable is worse than one that was never indexed.
    */
   async indexCollections(collections: RecordCollections): Promise<number> {
-    const data = collections;
+    // Misconfiguration must be loud. With no specs this method could only ever index nothing, and a
+    // silent 0 is indistinguishable from "the collections were empty" — a wiring bug that would
+    // otherwise be debugged as a retrieval-quality problem.
+    if (this.sources.length === 0) {
+      throw new Error('indexCollections requires GraphRagOptions.sources — with no specs, nothing can be indexed');
+    }
     const inputs: NodeInput[] = [];
     for (const spec of this.sources) {
-      const arr = data[spec.key];
+      const arr = collections[spec.key];
       if (!Array.isArray(arr)) continue;
       for (const rec of arr) {
+        const idField = spec.id ?? 'id';
+        const rawId = rec[idField];
+        // node_id is UNIQUE with upsert semantics, so records with a missing id would all collapse
+        // into one node named "undefined" — silently. A loud error names the actual mistake.
+        if (rawId === undefined || rawId === null || String(rawId).trim() === '') {
+          throw new Error(`collection '${spec.key}': record with no '${idField}' — set SourceSpec.id to the field holding your record ids`);
+        }
+        const id = String(rawId);
         const title = String(rec[spec.title] ?? '').trim();
         const body = [spec.decorate?.(rec) ?? '', ...spec.body.map((f) => String(rec[f] ?? ''))]
           .join(' ')
           .trim();
         if (title || body) {
           inputs.push({
-            id: String(rec.id),
+            id,
             kind: spec.kind,
             title: title || spec.kind,
             body,
             salience: asSalience(rec.salience),
           });
         }
-        inputs.push(...childNodesFor(String(rec.id), title || spec.kind, rec[spec.children ?? "details"] as ChildFact[] | undefined));
+        // Child expansion is opt-in: only a field the spec names is read.
+        if (spec.children) {
+          inputs.push(...childNodesFor(id, title || spec.kind, rec[spec.children] as ChildFact[] | undefined));
+        }
       }
     }
     return this.indexNodes(inputs);
   }
 
   /**
-   * The detail-node ids currently indexed for a record. The caller diffs this against the record's live
-   * details and removes what no longer exists — a deleted child must stop being retrievable, or a user
+   * The child-node ids currently indexed for a record. The caller diffs this against the record's live
+   * children and removes what no longer exists — a deleted child must stop being retrievable, or a user
    * deletes a fact and the system keeps surfacing it, which is worse than never having stored it.
    */
-  detailNodeIdsOf(recordId: string): string[] {
+  childNodeIdsOf(recordId: string): string[] {
     const rows = this.db
-      .prepare(`SELECT node_id FROM nodes WHERE scope_id = ? AND kind = 'detail' AND node_id LIKE ?`)
-      .all(this.scopeId, `${recordId}#d%`) as Array<{ node_id: string }>;
-    return rows.map((r) => r.node_id);
+      .prepare(`SELECT node_id FROM nodes WHERE scope_id = ? AND kind = ?`)
+      .all(this.scopeId, DETAIL_KIND) as Array<{ node_id: string }>;
+    // Prefix-compare in JS rather than SQL LIKE: `%` and `_` in a record id must not act as wildcards
+    // against OTHER records' children, because the caller deletes what this returns.
+    const prefix = childNodeIdPrefix(recordId);
+    return rows.map((r) => r.node_id).filter((id) => id.startsWith(prefix));
   }
 
   removeNode(id: string): void {
@@ -339,12 +387,15 @@ export class GraphRagIndex {
   /** Wipe this corpus's entire node index (nodes + FTS + vectors). Call before a full
    *  re-index — e.g. after switching embedding models (dimensions change). */
   clear(): void {
+    // node_id list is still needed for the in-memory vector removals below; the FTS delete itself is
+    // set-based rather than one statement per row.
     const rows = this.db
-      .prepare(`SELECT rowid, node_id FROM nodes WHERE scope_id = ?`)
-      .all(this.scopeId) as Array<{ rowid: number; node_id: string }>;
+      .prepare(`SELECT node_id FROM nodes WHERE scope_id = ?`)
+      .all(this.scopeId) as Array<{ node_id: string }>;
     this.db.transaction(() => {
-      const delFts = this.db.prepare(`DELETE FROM nodes_fts WHERE rowid = ?`);
-      for (const r of rows) delFts.run(r.rowid);
+      this.db
+        .prepare(`DELETE FROM nodes_fts WHERE rowid IN (SELECT rowid FROM nodes WHERE scope_id = ?)`)
+        .run(this.scopeId);
       this.db.prepare(`DELETE FROM nodes WHERE scope_id = ?`).run(this.scopeId);
     });
     for (const r of rows) this.index.remove(r.node_id);
@@ -423,7 +474,7 @@ export class GraphRagIndex {
         id,
         kind: r.kind,
         title: r.title,
-        snippet: (r.body || r.title).slice(0, 200),
+        snippet: this.snippetOf(r.body, r.title),
         score,
         vectorRank: vecRank.get(id),
         keywordRank: kwRank.get(id),
@@ -433,13 +484,15 @@ export class GraphRagIndex {
     return out;
   }
 
-  /** Graph neighbourhood of a node via the store's `edges` (undirected BFS to `depth`). */
+  /** Graph neighbourhood of a node via the consumer's `edges` table (undirected BFS to `depth`). */
   neighbors(id: string, opts?: { depth?: number; limit?: number }): Neighbor[] {
-    if (!this.hasEdgeTable) return [];
-    const depth = Math.max(1, opts?.depth ?? 1);
-    const limit = opts?.limit ?? 20;
+    if (!this.edgeTablePresent()) return [];
+    return this.expand(this.buildAdjacency(), id, opts);
+  }
 
-    type Step = { to: string; relation: string; weight: number; via: string; direction: 'out' | 'in' };
+  /** Read every edge for this scope and build the traversal map. Called fresh so late-written rows
+   *  are always seen; retrieveContext builds it ONCE and shares it across seeds. */
+  private buildAdjacency(): Map<string, Step[]> {
     const adj = new Map<string, Step[]>();
     const link = (from: string, step: Step) => {
       const a = adj.get(from) ?? [];
@@ -450,6 +503,14 @@ export class GraphRagIndex {
       link(e.sourceId, { to: e.targetId, relation: e.type, weight: e.weight, via: e.id, direction: 'out' });
       link(e.targetId, { to: e.sourceId, relation: e.type, weight: e.weight, via: e.id, direction: 'in' });
     }
+    return adj;
+  }
+
+  /** BFS from `id` over a prebuilt adjacency map. Split from neighbors() so a multi-seed retrieval
+   *  can expand every seed against one map instead of re-reading the edge table per seed. */
+  private expand(adj: Map<string, Step[]>, id: string, opts?: { depth?: number; limit?: number }): Neighbor[] {
+    const depth = Math.max(1, opts?.depth ?? 1);
+    const limit = opts?.limit ?? 20;
 
     const visited = new Set<string>([id]);
     let frontier = [id];
@@ -474,6 +535,9 @@ export class GraphRagIndex {
       id: f.to,
       title: titles.get(f.to)?.title ?? '',
       kind: titles.get(f.to)?.kind ?? 'unknown',
+      // The neighbour's own tier rides along: an incidental fact reached through an edge is still
+      // incidental, and the context builder must rank and tag it as such.
+      salience: titles.get(f.to)?.salience ?? 'notable',
       relation: f.relation,
       weight: f.weight,
       via: f.via,
@@ -488,34 +552,40 @@ export class GraphRagIndex {
    */
   private exactTitleSeeds(query: string, limit: number): Hit[] {
     if (!query.trim()) return [];
+    // Narrow scan on purpose: no bodies here — only the handful of MATCHED rows need one, fetched
+    // below — and child nodes are excluded in SQL: they borrow their parent's title, so every child
+    // of a named record would match the name and flood the guaranteed-seed slots that exist to
+    // protect the RECORD itself. Children earn their place through ranked retrieval like anything else.
     const rows = this.db
-      .prepare(`SELECT node_id, kind, title, body, salience FROM nodes WHERE scope_id = ?`)
-      .all(this.scopeId) as Array<{ node_id: string; kind: string; title: string; body: string; salience: string }>;
+      .prepare(`SELECT node_id, kind, title, salience FROM nodes WHERE scope_id = ? AND kind != ?`)
+      .all(this.scopeId, DETAIL_KIND) as Array<{ node_id: string; kind: string; title: string; salience: string }>;
     const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const out: Hit[] = [];
+    const matched: typeof rows = [];
     for (const r of rows) {
       const t = r.title.trim();
       if (t.length < 3) continue; // too-short titles ("Ox") false-match; skip
-      // DETAIL nodes borrow their parent's title, so every detail of a named place would match the name and
-      // flood the guaranteed-seed slots that exist to protect the RECORD itself. Details earn their place
-      // through ranked retrieval like anything else.
-      if (r.kind === 'detail') continue;
       // collapse internal whitespace runs to \s+ so a double-spaced stored title ("Payments  API") still
       // matches a normally-spaced mention — otherwise the named entity silently loses its guaranteed seed.
       const pattern = t.split(/\s+/).map(esc).join('\\s+');
       if (new RegExp(`(^|\\W)${pattern}(\\W|$)`, 'i').test(query)) {
-        out.push({
-          id: r.node_id,
-          kind: r.kind,
-          title: r.title,
-          snippet: (r.body || r.title).slice(0, 200),
-          score: Infinity,
-          salience: asSalience(r.salience),
-        });
-        if (out.length >= limit) break;
+        matched.push(r);
+        if (matched.length >= limit) break;
       }
     }
-    return out;
+    if (matched.length === 0) return [];
+    const placeholders = matched.map(() => '?').join(',');
+    const bodies = this.db
+      .prepare(`SELECT node_id, body FROM nodes WHERE scope_id = ? AND node_id IN (${placeholders})`)
+      .all(this.scopeId, ...matched.map((m) => m.node_id)) as Array<{ node_id: string; body: string }>;
+    const bodyOf = new Map(bodies.map((b) => [b.node_id, b.body]));
+    return matched.map((r) => ({
+      id: r.node_id,
+      kind: r.kind,
+      title: r.title,
+      snippet: this.snippetOf(bodyOf.get(r.node_id) ?? '', r.title),
+      score: Infinity,
+      salience: asSalience(r.salience),
+    }));
   }
 
   /** Hybrid search → 1-hop graph expansion → a context bundle for the AI (GraphRAG). */
@@ -537,11 +607,16 @@ export class GraphRagIndex {
     seeds.splice(Math.max(want, exact.length)); // cap, but never below the count of explicitly-named entities
     const related: Neighbor[] = [];
     const seen = new Set(seeds.map((s) => s.id));
-    for (const s of seeds) {
-      for (const nb of this.neighbors(s.id, { depth: opts?.depth ?? 1, limit: opts?.neighbors ?? 5 })) {
-        if (seen.has(nb.id)) continue;
-        seen.add(nb.id);
-        related.push(nb);
+    if (this.edgeTablePresent()) {
+      // One adjacency build for the whole retrieval. Expanding through neighbors() per seed would
+      // re-read and re-JSON.parse the entire edge table once per seed, for identical data.
+      const adj = this.buildAdjacency();
+      for (const s of seeds) {
+        for (const nb of this.expand(adj, s.id, { depth: opts?.depth ?? 1, limit: opts?.neighbors ?? 5 })) {
+          if (seen.has(nb.id)) continue;
+          seen.add(nb.id);
+          related.push(nb);
+        }
       }
     }
     return { query, seeds, related };
@@ -554,7 +629,19 @@ export class GraphRagIndex {
     const out: GraphEdge[] = [];
     for (const r of rows) {
       try {
-        out.push(JSON.parse(r.data) as GraphEdge);
+        const e = JSON.parse(r.data) as Partial<GraphEdge>;
+        // The host owns this table, so SHAPE is untrusted exactly like syntax is: an edge whose
+        // endpoints aren't strings would key the adjacency map on `undefined` and leak undefined
+        // relation/weight into the Neighbor contract. A wrong-shaped row is skipped like a malformed
+        // one; the two optional fields degrade to safe values instead of poisoning the output.
+        if (typeof e?.id !== 'string' || typeof e.sourceId !== 'string' || typeof e.targetId !== 'string') continue;
+        out.push({
+          id: e.id,
+          sourceId: e.sourceId,
+          targetId: e.targetId,
+          type: typeof e.type === 'string' ? e.type : '',
+          weight: typeof e.weight === 'number' && Number.isFinite(e.weight) ? e.weight : 0,
+        });
       } catch {
         // skip malformed row
       }
@@ -562,15 +649,20 @@ export class GraphRagIndex {
     return out;
   }
 
-  private titlesFor(ids: string[]): Map<string, { title: string; kind: string }> {
+  private titlesFor(ids: string[]): Map<string, { title: string; kind: string; salience: Salience }> {
     const uniq = [...new Set(ids)];
     if (uniq.length === 0) return new Map();
     const placeholders = uniq.map(() => '?').join(',');
     const rows = this.db
       .prepare(
-        `SELECT node_id, title, kind FROM nodes WHERE scope_id = ? AND node_id IN (${placeholders})`,
+        `SELECT node_id, title, kind, salience FROM nodes WHERE scope_id = ? AND node_id IN (${placeholders})`,
       )
-      .all(this.scopeId, ...uniq) as Array<{ node_id: string; title: string; kind: string }>;
-    return new Map(rows.map((r) => [r.node_id, { title: r.title, kind: r.kind }]));
+      .all(this.scopeId, ...uniq) as Array<{ node_id: string; title: string; kind: string; salience: string }>;
+    return new Map(rows.map((r) => [r.node_id, { title: r.title, kind: r.kind, salience: asSalience(r.salience) }]));
+  }
+
+  /** One home for the snippet policy, so ranked hits and exact-name seeds render identically. */
+  private snippetOf(body: string, title: string): string {
+    return (body || title).slice(0, 200);
   }
 }

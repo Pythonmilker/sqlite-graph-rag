@@ -30,7 +30,7 @@ export function asSalience(v: unknown): Salience {
 }
 
 /**
- * The compact tag rendered on a context line, e.g. `- The Hollow Well [place · incidental]: …`.
+ * The compact tag rendered on a context line, e.g. `- Payments API [service · incidental]: …`.
  *
  * `notable` renders empty on purpose: it is the default, and restating it on most lines would spend
  * tokens to say nothing while diluting the two tags that carry meaning.
@@ -50,9 +50,22 @@ export interface ChildFact {
   salience?: Salience;
 }
 
+/**
+ * The node kind minted for child facts. Exported because three modules special-case it — pruning
+ * skips these nodes, exact-title seeding excludes them, reconciliation queries them — and a literal
+ * retyped in each is a rename away from all three silently disagreeing.
+ */
+export const DETAIL_KIND = 'detail' as const;
+
 /** Stable id for a child node, so re-indexing a parent updates its children rather than duplicating. */
 export function childNodeId(parentId: string, childId: string): string {
-  return `${parentId}#d${childId}`;
+  return `${childNodeIdPrefix(parentId)}${childId}`;
+}
+
+/** The prefix every child of `parentId` shares — the one definition of the id scheme, so the code
+ *  that matches child ids and the code that mints them cannot drift apart. */
+export function childNodeIdPrefix(parentId: string): string {
+  return `${parentId}#d`;
 }
 
 /**
@@ -66,17 +79,22 @@ export function childNodesFor(
   parentId: string,
   parentTitle: string,
   children: readonly ChildFact[] | undefined,
-): Array<{ id: string; kind: 'detail'; title: string; body: string; salience: Salience }> {
+): Array<{ id: string; kind: typeof DETAIL_KIND; title: string; body: string; salience: Salience }> {
   if (!Array.isArray(children)) return [];
-  const out: Array<{ id: string; kind: 'detail'; title: string; body: string; salience: Salience }> = [];
+  const out: Array<{ id: string; kind: typeof DETAIL_KIND; title: string; body: string; salience: Salience }> = [];
   for (const c of children) {
-    if (!c?.id || !c.text?.trim()) continue;
+    // The text check is a type test, not just a truthiness test: children arrive from arbitrary host
+    // records, and calling .trim() on a number mid-transaction would abort the whole indexing batch.
+    if (!c?.id || typeof c.text !== 'string' || !c.text.trim()) continue;
     out.push({
       id: childNodeId(parentId, c.id),
-      kind: 'detail',
+      kind: DETAIL_KIND,
       title: parentTitle,
       body: c.text.trim(),
-      salience: asSalience(c.salience),
+      // Unmarked child facts default INCIDENTAL, not the global 'notable'. The point of a remembered
+      // annotation is that it stays available without being volunteered every turn; promotion is an
+      // explicit act. Parent records keep the notable default — this rule is for their children.
+      salience: c.salience === undefined ? 'incidental' : asSalience(c.salience),
     });
   }
   return out;

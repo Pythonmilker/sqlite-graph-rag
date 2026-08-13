@@ -258,3 +258,124 @@ describe('GraphRagIndex', () => {
     expect(await kb.search('billing')).toEqual([]);
   });
 });
+
+describe('host-contract hardening (regressions from review)', () => {
+  const CHILD_SOURCES: SourceSpec[] = [
+    { key: 'records', kind: 'record', title: 'name', body: ['description'], children: 'facts' },
+  ];
+
+  it('childNodeIdsOf treats LIKE metachars in a record id as literals, not wildcards', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    const kb = new GraphRagIndex({ db, embedder: null, scopeId, sources: CHILD_SOURCES });
+    await kb.indexCollections({
+      records: [
+        { id: 'item_1', name: 'Underscore item', description: 'x', facts: [{ id: 'a', text: 'fact of item_1' }] },
+        { id: 'itemA1', name: 'Lookalike item', description: 'y', facts: [{ id: 'b', text: 'fact of itemA1' }] },
+      ],
+    });
+    // '_' must NOT match the 'A': returning itemA1's child here feeds the caller's delete-reconcile
+    // flow another record's live children.
+    expect(kb.childNodeIdsOf('item_1')).toEqual(['item_1#da']);
+  });
+
+  it('a record with no usable id is a loud error naming the field, never a silent collapse', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    const kb = new GraphRagIndex({ db, embedder: null, scopeId, sources: SOURCES });
+    await expect(
+      kb.indexCollections({ services: [{ _id: 'svc-1', name: 'auth-service', description: 'tokens' }] }),
+    ).rejects.toThrow(/SourceSpec.id/);
+    expect(kb.stats().nodes).toBe(0);
+  });
+
+  it('SourceSpec.id remaps the id field for hosts that do not key records by `id`', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    const kb = new GraphRagIndex({
+      db,
+      embedder: null,
+      scopeId,
+      sources: [{ key: 'services', kind: 'service', id: '_id', title: 'name', body: ['description'] }],
+    });
+    await kb.indexCollections({ services: [{ _id: 'svc-1', name: 'auth-service', description: 'issues tokens' }] });
+    const hits = await kb.search('tokens');
+    expect(hits.some((h) => h.id === 'svc-1')).toBe(true);
+  });
+
+  it('indexCollections with no sources throws instead of silently indexing nothing', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    const kb = new GraphRagIndex({ db, embedder: null, scopeId });
+    await expect(kb.indexCollections(sampleCollections())).rejects.toThrow(/sources/);
+  });
+
+  it('an edges table created AFTER construction is picked up — the host owns its migration order', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    const kb = new GraphRagIndex({ db, embedder: hashingEmbedder(), scopeId, sources: SOURCES });
+    await kb.indexCollections(sampleCollections());
+    expect(kb.neighbors(AUTH)).toEqual([]); // no table yet — degrade, don't throw
+    createEdgeTable(db);
+    for (const e of EDGES) addEdge(db, e);
+    expect(kb.neighbors(AUTH).some((n) => n.id === RUNBOOK)).toBe(true);
+  });
+
+  it('edge rows with the wrong shape are skipped; optional fields degrade instead of poisoning output', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    createEdgeTable(db);
+    // wrong endpoint field names: valid JSON, wrong shape → skipped like malformed JSON
+    db.prepare(`INSERT INTO edges(id, scope_id, data) VALUES('e1', ?, ?)`).run(
+      scopeId,
+      JSON.stringify({ id: 'e1', source_id: AUTH, target_id: RUNBOOK, type: 'documented_by', weight: 1 }),
+    );
+    // right endpoints, missing type/weight → kept with safe degraded values
+    db.prepare(`INSERT INTO edges(id, scope_id, data) VALUES('e2', ?, ?)`).run(
+      scopeId,
+      JSON.stringify({ id: 'e2', sourceId: AUTH, targetId: RUNBOOK }),
+    );
+    const kb = new GraphRagIndex({ db, embedder: hashingEmbedder(), scopeId, sources: SOURCES });
+    await kb.indexCollections(sampleCollections());
+    const nbs = kb.neighbors(AUTH);
+    expect(nbs).toHaveLength(1);
+    expect(nbs[0]).toMatchObject({ id: RUNBOOK, relation: '', weight: 0 });
+  });
+
+  it('child expansion is opt-in, and an unmarked child fact defaults to incidental', async () => {
+    const db = betterSqlite3Driver(new Database(':memory:'));
+    // No `children` in the spec: an unrelated `details` array must NOT be indexed.
+    const noOptIn = new GraphRagIndex({
+      db,
+      embedder: null,
+      scopeId,
+      sources: [{ key: 'orders', kind: 'order', title: 'name', body: ['description'] }],
+    });
+    await noOptIn.indexCollections({
+      orders: [{ id: 'o1', name: 'Order 7', description: 'shipped', details: [{ id: 'd1', text: 'gift wrap, no receipt' }] }],
+    });
+    expect(noOptIn.stats().nodes).toBe(1);
+    expect(await noOptIn.search('gift')).toHaveLength(0);
+
+    // Opted in: the child indexes as its own node, and with no salience set it lands INCIDENTAL —
+    // remembered without being volunteered; promotion is an explicit act.
+    const db2 = betterSqlite3Driver(new Database(':memory:'));
+    const optIn = new GraphRagIndex({
+      db: db2,
+      embedder: null,
+      scopeId,
+      sources: [{ key: 'orders', kind: 'order', title: 'name', body: ['description'], children: 'details' }],
+    });
+    await optIn.indexCollections({
+      orders: [
+        {
+          id: 'o1',
+          name: 'Order 7',
+          description: 'shipped',
+          details: [
+            { id: 'd1', text: 'gift wrap, no receipt' },
+            { id: 'd2', text: 12345 }, // non-string text: skipped, never a mid-transaction throw
+          ],
+        },
+      ],
+    });
+    expect(optIn.stats().nodes).toBe(2);
+    const [child] = await optIn.search('gift');
+    expect(child.id).toBe('o1#dd1');
+    expect(child.salience).toBe('incidental');
+  });
+});

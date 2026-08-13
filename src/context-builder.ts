@@ -7,15 +7,17 @@ import type { GraphContext, Hit, Neighbor } from './graph-rag-index';
  * Two HARD-SEPARATED blocks from a GraphRAG bundle:
  *   • FACTS     — a structured entity/relationship snapshot from the KG = GROUND TRUTH. Prioritized;
  *                 a name-only fallback per line means a NAME is never dropped, only its description.
- *   • NARRATIVE — prose snippets (session notes, plot beats) = TONE ONLY, never authoritative; the
- *                 first thing trimmed under budget pressure.
+ *   • NARRATIVE — free prose (notes, running commentary) = TONE ONLY, never authoritative; the
+ *                 first thing trimmed under budget pressure. Which kinds route here is the CALLER's
+ *                 call via `narrativeKinds` — kinds are consumer-defined, so no default can know
+ *                 which of them carry prose rather than canon.
  * Splitting them neutralizes the two failure modes of a single context blob: retrieval-miss (facts are
  * regenerated from the KG every turn, not carried in a drifting summary) and summary-drift (narrative is
  * explicitly labelled untrusted-for-fact).
  *
- * Pure + deterministic (no IO) so it unit-tests without a DB and runs IDENTICALLY in the desktop sidecar
- * and the mobile client. The invariant the pivot rests on: the returned block is ALWAYS <= maxTokens,
- * regardless of corpus size — cost scales with the retrieved top-k, not with how much data exists.
+ * Pure + deterministic (no IO) so it unit-tests without a DB and runs identically in any host. The
+ * invariant everything rests on: the returned block is ALWAYS <= maxTokens, regardless of corpus
+ * size — cost scales with the retrieved top-k, not with how much data exists.
  */
 
 const CHARS_PER_TOKEN = 4;
@@ -33,9 +35,6 @@ export function estimateTokens(s: string): number {
   return Math.ceil(wide * 2 + (s.length - wide) / CHARS_PER_TOKEN);
 }
 
-/** Kinds whose prose is STORY-IN-MOTION (tone), not canonical world state — routed to NARRATIVE. */
-const NARRATIVE_KINDS = new Set(['note', 'plot']);
-
 export interface ContextOptions {
   /** Soft ceiling for facts+narrative; narrative (then fact descriptions) trim to fit. Default 1800. */
   budgetTokens?: number;
@@ -45,6 +44,12 @@ export interface ContextOptions {
   snippetChars?: number;
   /** Max chars of each fact description. Default 160. */
   factChars?: number;
+  /**
+   * Kinds whose prose is running commentary rather than canonical state — routed to the tone-only
+   * NARRATIVE block and trimmed first. Default: none. Kinds are consumer-defined via SourceSpec, so
+   * a built-in list would silently demote (or canonize) whatever kinds a consumer happens to name.
+   */
+  narrativeKinds?: readonly string[];
 }
 
 export interface ContextResult {
@@ -62,24 +67,24 @@ export interface ContextResult {
   narrativeDropped: number;
 }
 
-const FACTS_HEADER = '=== WORLD FACTS (authoritative — treat as canon; do not contradict) ===';
+const FACTS_HEADER = '=== FACTS (authoritative — do not contradict) ===';
 const NARRATIVE_HEADER = '=== RECENT NARRATIVE (tone only — NOT authoritative; never cite as fact) ===';
 
 /**
- * THE PROMINENCE RULE — the second half of tiering, and the half that actually changes behaviour.
+ * THE SALIENCE RULE — the second half of tiering, and the half that actually changes behaviour.
  *
  * The column alone only reorders lines. Without a stated rule the model reads `· incidental` as decoration
- * and keeps volunteering everything, because "here is a fact about this place" reads as an instruction to
+ * and keeps volunteering everything, because "here is a fact about this thing" reads as an instruction to
  * use it. So the rule travels attached to the block it governs, emitted only when a tagged line is present:
  * one place, impossible to drift from the data, and free on the ordinary turn where nothing is tagged.
  *
- * The failure this prevents is specific. Every fact retrieved about a location is TRUE, so a model with no
- * emphasis signal recites all of it — the exhaustive room description that reads like an inventory instead
- * of a scene. Salience is what lets a detail be remembered without being performed.
+ * The failure this prevents is specific. Every retrieved fact is TRUE, so a model with no emphasis signal
+ * recites all of it — the exhaustive answer that reads like an inventory instead of a reply. Salience is
+ * what lets a fact be remembered without being performed.
  */
-const PROMINENCE_RULE =
+const SALIENCE_RULE =
   'Tags: `defining` = what the thing IS — lead with it, never contradict it. `incidental` = true but minor — ' +
-  'do NOT volunteer it; use it only if asked, or if the players reach for it. Untagged sits between. ' +
+  'do NOT volunteer it; use it only if asked, or if the conversation reaches for it. Untagged sits between. ' +
   'Listing a fact here is permission to KNOW it, not an instruction to say it.';
 
 const oneLine = (s: string): string => (s ?? '').replace(/\s+/g, ' ').trim();
@@ -106,41 +111,49 @@ export function buildContext(ctx: GraphContext | null | undefined, opts: Context
   const seeds: Hit[] = Array.isArray(ctx.seeds) ? ctx.seeds : [];
   const related: Neighbor[] = Array.isArray(ctx.related) ? ctx.related : [];
   if (seeds.length === 0 && related.length === 0) return { ...EMPTY };
+  const narrativeKinds = new Set(opts.narrativeKinds ?? []);
 
-  // Source lines. Each fact carries a `nameOnly` fallback so its NAME outlives its description.
-  type FactLine = { nameOnly: string; full: string; rank: number };
+  // Source lines. Each fact carries a `nameOnly` fallback so its NAME outlives its description, and a
+  // `tagged` flag — did this line actually render a salience tag — that later gates the rule block.
+  // A flag per line, not a shared boolean: whether the rule is worth its tokens depends on the lines
+  // that actually made it into the block, not on every line that was ever considered.
+  type FactLine = { nameOnly: string; full: string; rank: number; tagged: boolean };
   const factSource: FactLine[] = [];
   const narrSource: string[] = [];
-  let tagged = false;
 
   /** `[place]` or, when the tier carries meaning, `[place · incidental]`. */
-  const bracket = (kind: string, p: Salience | undefined): string => {
-    const tag = salienceTag(asSalience(p));
-    if (tag) tagged = true;
-    return tag ? `[${kind} · ${tag}]` : `[${kind}]`;
-  };
+  const bracket = (kind: string, tag: string): string => (tag ? `[${kind} · ${tag}]` : `[${kind}]`);
 
   for (const s of seeds) {
     const title = oneLine(s.title) || s.kind;
     const prom = asSalience(s.salience);
-    const nameOnly = `- ${title} ${bracket(s.kind, prom)}`;
+    const tag = salienceTag(prom);
+    const nameOnly = `- ${title} ${bracket(s.kind, tag)}`;
     const rank = SALIENCE_RANK[prom];
-    if (NARRATIVE_KINDS.has(s.kind)) {
+    if (narrativeKinds.has(s.kind)) {
       const prose = oneLine(s.snippet);
       if (prose) narrSource.push(`- ${title}: ${clip(prose, snippetChars)}`);
-      else factSource.push({ nameOnly, full: nameOnly, rank }); // titled-but-prose-less note → at least anchor the name
+      else factSource.push({ nameOnly, full: nameOnly, rank, tagged: !!tag }); // titled-but-prose-less note → at least anchor the name
     } else {
       const desc = oneLine(s.snippet);
-      factSource.push({ nameOnly, full: desc ? `${nameOnly}: ${clip(desc, factChars)}` : nameOnly, rank });
+      factSource.push({ nameOnly, full: desc ? `${nameOnly}: ${clip(desc, factChars)}` : nameOnly, rank, tagged: !!tag });
     }
   }
   for (const r of related) {
     const title = oneLine(r.title) || r.kind;
     const rel = oneLine(r.relation);
-    const nameOnly = `- ${title} [${r.kind}]`;
-    // a graph neighbour arrives via an edge, not a node read, so it carries no salience — rank it as the
-    // default rather than inventing one.
-    factSource.push({ nameOnly, full: rel ? `${nameOnly} —(${rel})— linked to a retrieved entity` : nameOnly, rank: SALIENCE_RANK.notable });
+    // The neighbour's own salience rides through expansion (it comes off its node row), so a fact
+    // reached through an edge keeps both its tag and its trim priority — an incidental fact is still
+    // incidental when the graph is what surfaced it.
+    const prom = asSalience(r.salience);
+    const tag = salienceTag(prom);
+    const nameOnly = `- ${title} ${bracket(r.kind, tag)}`;
+    factSource.push({
+      nameOnly,
+      full: rel ? `${nameOnly} —(${rel})— linked to a retrieved entity` : nameOnly,
+      rank: SALIENCE_RANK[prom],
+      tagged: !!tag,
+    });
   }
 
   // KG MEMORY: order by salience before the budget passes below decide what survives. Retrieval order is
@@ -175,13 +188,14 @@ export function buildContext(ctx: GraphContext | null | undefined, opts: Context
   // ---- Phase 2b: the salience rule, charged AFTER the facts it explains. ----
   // Facts come first on purpose. The rule is a fixed ~60-token block, so reserving it up front starved
   // the fact list entirely at a tight ceiling — the block came back EMPTY, which is the one outcome worse
-  // than an unexplained tag. So: admit the facts, then take the rule only if a tag actually survived AND
-  // it fits under the hard ceiling. Charged here, before narrative, so the ceiling stays exact.
+  // than an unexplained tag. So: admit the facts, then take the rule only if a tagged line actually made
+  // it into the block AND the rule fits under the hard ceiling. The gate reads the per-line `tagged`
+  // flags of the INCLUDED set — never the rendered text — so presentation format can change freely and
+  // a line dropped at the ceiling can't smuggle the rule in on behalf of a tag nobody will see.
   const ruleEmitted =
-    tagged &&
-    factText.some((l) => l.includes(' · ')) &&
-    factsTok + estimateTokens(PROMINENCE_RULE) + 1 <= hardMax;
-  if (ruleEmitted) factsTok += estimateTokens(PROMINENCE_RULE) + 1;
+    included.some((inc) => inc.src.tagged) &&
+    factsTok + estimateTokens(SALIENCE_RULE) + 1 <= hardMax;
+  if (ruleEmitted) factsTok += estimateTokens(SALIENCE_RULE) + 1;
 
   // ---- Phase 3: narrative snippets fill whatever soft budget remains. ----
   const narrText: string[] = [];
@@ -200,7 +214,7 @@ export function buildContext(ctx: GraphContext | null | undefined, opts: Context
 
   // ---- assemble ----
   const parts: string[] = [];
-  if (factText.length) parts.push(`${FACTS_HEADER}\n${ruleEmitted ? `${PROMINENCE_RULE}\n` : ''}${factText.join('\n')}`);
+  if (factText.length) parts.push(`${FACTS_HEADER}\n${ruleEmitted ? `${SALIENCE_RULE}\n` : ''}${factText.join('\n')}`);
   if (narrText.length) parts.push(`${NARRATIVE_HEADER}\n${narrText.join('\n')}`);
   const text = parts.join('\n\n');
 

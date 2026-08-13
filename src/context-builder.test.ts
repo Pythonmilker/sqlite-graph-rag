@@ -5,10 +5,11 @@ import type { GraphContext, Hit, Neighbor } from './graph-rag-index';
 
 const hit = (id: string, kind: string, title: string, snippet = '', salience: Salience = 'notable'): Hit =>
   ({ id, kind, title, snippet, score: 1, salience });
-const neighbor = (id: string, title: string, relation: string, kind = 'entity'): Neighbor => ({
+const neighbor = (id: string, title: string, relation: string, kind = 'entity', salience: Salience = 'notable'): Neighbor => ({
   id,
   title,
   kind,
+  salience,
   relation,
   weight: 1,
   via: `edge-${id}`,
@@ -43,29 +44,34 @@ describe('buildContext', () => {
 
   it('renders entity seeds as authoritative FACTS with name + kind + description', () => {
     const r = buildContext(ctx([hit('1', 'entity', 'auth-service', 'issues session tokens for every request')]));
-    expect(r.text).toContain('WORLD FACTS');
+    expect(r.text).toContain('FACTS (authoritative');
     expect(r.text).toContain('auth-service [entity]');
     expect(r.text).toContain('issues session tokens');
     expect(r.factsCount).toBe(1);
     expect(r.narrativeCount).toBe(0);
   });
 
-  it('routes session notes / plot beats to NARRATIVE, not FACTS', () => {
-    const r = buildContext(
-      ctx([
-        hit('1', 'entity', 'Payments API', 'reconciles invoices nightly'),
-        hit('2', 'note', 'Session 3', 'the party fled into the snow as embers died'),
-        hit('3', 'plot', 'The Frozen Oath', 'a debt sworn on the dying fire'),
-      ]),
-    );
-    expect(r.text).toContain('WORLD FACTS');
+  it('routes the kinds the CALLER names to NARRATIVE — routing is opt-in, never assumed', () => {
+    const c = ctx([
+      hit('1', 'entity', 'Payments API', 'reconciles invoices nightly'),
+      hit('2', 'note', 'Standup 3', 'the deploy freeze lifted after the incident closed'),
+      hit('3', 'update', 'Cutover plan', 'a migration pledged for the next window'),
+    ]);
+    const r = buildContext(c, { narrativeKinds: ['note', 'update'] });
+    expect(r.text).toContain('FACTS (authoritative');
     expect(r.text).toContain('Payments API [entity]');
     expect(r.text).toContain('RECENT NARRATIVE');
-    expect(r.text).toContain('embers died');
+    expect(r.text).toContain('deploy freeze lifted');
     expect(r.factsCount).toBe(1);
     expect(r.narrativeCount).toBe(2);
     // narrative prose must sit under the NON-authoritative header, never above the facts header
-    expect(r.text.indexOf('WORLD FACTS')).toBeLessThan(r.text.indexOf('RECENT NARRATIVE'));
+    expect(r.text.indexOf('FACTS (authoritative')).toBeLessThan(r.text.indexOf('RECENT NARRATIVE'));
+
+    // and WITHOUT the option, the same kinds are ordinary authoritative facts: a consumer's 'note'
+    // records are canon unless the consumer says otherwise
+    const plain = buildContext(c);
+    expect(plain.narrativeCount).toBe(0);
+    expect(plain.factsCount).toBe(3);
   });
 
   it('renders graph neighbours as facts carrying the relation', () => {
@@ -73,6 +79,15 @@ describe('buildContext', () => {
     expect(r.text).toContain('Payments API [location]');
     expect(r.text).toContain('calls');
     expect(r.factsCount).toBe(2);
+  });
+
+  it('a neighbour keeps its own tier — incidental reached through an edge is still incidental', () => {
+    const r = buildContext(
+      ctx([hit('1', 'entity', 'auth-service', 'issues tokens')], [neighbor('2', 'Legacy relay', 'calls', 'service', 'incidental')]),
+    );
+    expect(r.text).toContain('Legacy relay [service · incidental]');
+    // and it loses the trim-priority contest against the notable seed
+    expect(r.text.indexOf('auth-service')).toBeLessThan(r.text.indexOf('Legacy relay'));
   });
 
   it('NEVER drops a name under soft-budget pressure — descriptions truncate first', () => {

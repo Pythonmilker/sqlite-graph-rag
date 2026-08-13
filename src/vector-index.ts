@@ -1,8 +1,8 @@
 /**
  * Pluggable nearest-neighbour index. The hybrid retriever only needs a ranked id
  * list, so the vector backend is swappable: `BruteForceIndex` (here, dependency-free,
- * correct everywhere) is the shippable baseline; a `sqlite-vec`-backed index can drop
- * in behind this same interface once Electron packaging of `vec0.dll` is validated.
+ * correct everywhere) is the baseline; a sqlite-vec or ANN-backed index can drop in
+ * behind this same interface when corpus size demands one.
  */
 export interface VectorIndex {
   upsert(id: string, vector: Float32Array): void;
@@ -26,8 +26,8 @@ export function l2normalize(v: Float32Array): Float32Array {
 /**
  * In-memory cosine index: stores L2-normalized vectors so cosine similarity is a
  * single dot loop, ranked by a full linear scan. Measured 1–13ms for a personal-scale
- * corpus (≤5k vectors) on Node 24 — instant for an interactive desktop tool, and the
- * service rehydrates it from persisted embeddings on construction.
+ * corpus (≤5k vectors) on Node 24 — instant for interactive use, and GraphRagIndex
+ * rehydrates it from persisted embeddings on construction.
  */
 export class BruteForceIndex implements VectorIndex {
   private readonly vecs = new Map<string, Float32Array>();

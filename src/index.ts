@@ -20,7 +20,16 @@ export type { ContextOptions, ContextResult } from './context-builder';
 export { deadNodes } from './prune';
 export type { NodeRef } from './prune';
 
-export { asSalience, salienceTag, childNodesFor, childNodeId, DEFAULT_SALIENCE, SALIENCE_RANK } from './salience';
+export {
+  asSalience,
+  salienceTag,
+  childNodesFor,
+  childNodeId,
+  childNodeIdPrefix,
+  DEFAULT_SALIENCE,
+  DETAIL_KIND,
+  SALIENCE_RANK,
+} from './salience';
 export type { Salience, ChildFact } from './salience';
 
 export { betterSqlite3Driver } from './sqlite';
