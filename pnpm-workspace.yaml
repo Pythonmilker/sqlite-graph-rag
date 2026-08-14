@@ -1,0 +1,11 @@
+# pnpm 11 reads the build allowlist from here, not from package.json — an `onlyBuiltDependencies` key
+# in package.json is silently ignored.
+#
+# Both entries are dev dependencies and both are load-bearing for `pnpm test`. `better-sqlite3` compiles
+# a native binding, and without it the driver cannot open a database at all. `esbuild` downloads a
+# platform binary, and without it vitest fails to start. Left unapproved, `pnpm install` prints
+# ERR_PNPM_IGNORED_BUILDS and exits non-zero, so the two commands in the README do not work on a fresh
+# clone — which is the only thing a reader is likely to try.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true

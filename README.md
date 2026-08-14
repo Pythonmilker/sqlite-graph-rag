@@ -4,7 +4,8 @@ Hybrid retrieval with graph expansion, inside a single SQLite file. A vector sea
 search are fused, then the results expand along a typed edge table and the neighbourhood is returned as
 model context.
 
-There is no vector database, no server, and no network call. It works with no embedder at all.
+There is no vector database and no server, and this library makes no network call of its own. The
+embedder is optional and supplied by the host, so where it runs is your choice.
 
 This is a code sample extracted from a shipping product, not a package to install. See
 [License](#license).
@@ -29,9 +30,22 @@ about directly.
 Leave `embedder` unset and the vector leg drops out. FTS5 and graph expansion carry retrieval on
 their own, and `retrieveContext` still returns seeds and their neighbourhood.
 
-This is a supported mode rather than a fallback. It is why the whole thing runs on a laptop with no
-network, and it is worth knowing that graph expansion is where a keyword-only setup gets most of its
-apparent intelligence.
+This is a supported mode rather than a fallback, and the reason is architectural: this library has no
+embedder of its own and no dependency on one, so adopting it does not commit you to an embedding stack.
+Two consequences that show up in practice. Rows persist with no vector, so retrieval works on a corpus
+that is still being embedded, or on rows that never will be. And the mode is covered rather than
+assumed: `src/graph-rag-index.test.ts` constructs the index with `embedder: null` and asserts keyword
+retrieval, stemming, child indexing, and that re-indexing an embedded row drops its stale vector while
+keeping FTS current.
+
+What it does not buy you is offline operation. That depends on where your embedder runs rather than on
+whether you have one: a local static embedder keeps everything on one machine, and a hosted API puts
+you on the network no matter what this setting says.
+
+Graph expansion is where a keyword-only setup gets most of its apparent intelligence, because the thing
+you failed to name is usually one edge from the thing you did. What it cannot do is paraphrase. A query
+that describes a record without sharing any of its vocabulary will not reach it lexically, and the graph
+only helps once something has matched.
 
 ## The host contract
 
