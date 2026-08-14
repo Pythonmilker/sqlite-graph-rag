@@ -1,7 +1,8 @@
 # sqlite-graph-rag
 
-Graph RAG that runs inside a single SQLite file. Retrieval fuses a vector search and a BM25 keyword
-search, then expands along a typed edge table and returns the neighbourhood as model context.
+Hybrid retrieval with graph expansion, inside a single SQLite file. A vector search and a BM25 keyword
+search are fused, then the results expand along a typed edge table and the neighbourhood is returned as
+model context.
 
 There is no vector database, no server, and no network call. It works with no embedder at all.
 
@@ -10,7 +11,7 @@ This is a code sample extracted from a shipping product, not a package to instal
 
 ## How retrieval works
 
-Three stages, and the third is what makes it graph RAG rather than vector search:
+Three stages, and the third is the one that makes this more than vector search:
 
 1. **Seed.** The query runs against an FTS5 index (bm25, porter stemming) and, if an embedder is
    configured, against a vector index. The two ranked lists are fused with Reciprocal Rank Fusion,
