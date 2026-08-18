@@ -162,6 +162,21 @@ src/sqlite.ts            the four-method SQLite interface, plus a better-sqlite3
 `better-sqlite3` is a dev dependency only. The library talks to the `SqliteDb` interface in
 `src/sqlite.ts`, so another driver is an afternoon.
 
+## Architecture map
+
+An interactive map of this codebase is served at
+https://pythonmilker.github.io/sqlite-graph-rag/. Click a node to drill into it; each element
+links to the source file it was read from, and the two trace views step through indexing and
+retrieval end to end.
+
+The map compiles from the plain-text model in `architecture/` (LikeC4 DSL, four files).
+`docs/index.html` is the compiled result, committed so the map works without any toolchain.
+After changing the model, rebuild with:
+
+```bash
+npx likec4@1.59.2 build --output-single-file --use-hash-history -o architecture/dist architecture
+```
+
 ## Known limits
 
 - The vector index is a brute-force cosine scan held in memory. That is deliberate at the scale this
