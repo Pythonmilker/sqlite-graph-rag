@@ -1,0 +1,109 @@
+views {
+
+  view index {
+    title '1 · System Context'
+    description '''
+      What this is: an embeddable retrieval library, not a service — everything runs inside the
+      host's process against one local SQLite file.
+
+      **Coverage**: all 6 source modules read in full (100% of `src/*.ts` excluding tests);
+      manifests, git history, and README read; the 5 test files skimmed for intent only;
+      `node_modules/` and lockfiles skipped. Nothing unresolved.
+
+      **What to read next**: click into `sqlite-graph-rag` for the modules, then `GraphRagIndex`
+      for the retrieval mechanics. The two traces show a batch being indexed and a query becoming
+      a prompt block.
+    '''
+    include *
+  }
+
+  view libView of lib {
+    title '2 · Modules'
+    description '''
+      Six modules, one file each. The engine (`GraphRagIndex`) does the IO; the context builder is
+      deliberately pure so it tests without a database; the vector index and the SQLite driver are
+      both interfaces with a default implementation — the two seams where scale and platform swap in.
+
+      **What surprised me**: the prune module's safety rule inverts the usual instinct — it refuses
+      to prune anything the caller didn't explicitly enumerate, because absence of evidence must not
+      delete a corpus. And the graph the library expands along is a table it does not even own.
+
+      **Read next**: `GraphRagIndex` internals (click it), then the data view for who owns which table.
+    '''
+    include *
+    include host, embedder, db
+  }
+
+  view retrieverView of lib.retriever {
+    title '3 · Inside GraphRagIndex'
+    description '''
+      Retrieval is three stages: seed (keyword + vector legs fused by RRF, with a guard that
+      force-includes any record named verbatim in the query), expand (breadth-first over the host's
+      edges, one adjacency build shared across seeds), return (the bundle the context builder
+      renders). Indexing is the mirror path: records in, one embed call, one transaction.
+
+      **What surprised me**: the exact-name guard — ranked retrieval alone is allowed to miss a
+      named record, so names get an infinite score and guaranteed seats. The retrieval cutoff can
+      only squeeze unnamed results.
+    '''
+    include *
+    include embedder, db.nodesTable, db.ftsTable, db.edgesTable
+    include lib.vectorIndex, lib.salience
+  }
+
+  view dataView of db {
+    title '5 · Data — one file, three tables, two owners'
+    description '''
+      The library's whole footprint in the host's database is two tables: `nodes` (rows + embedding
+      bytes + salience) and `nodes_fts` (the keyword index over them, kept in lockstep inside each
+      write transaction). The third table, `edges`, is the host's: the library only reads it, treats
+      its JSON as untrusted input, and re-probes for it until it exists — the host's migrations may
+      create it after the index is constructed.
+
+      **Read next**: the salience column's reason for existing is in the Salience module's panel —
+      it is a column precisely so it never becomes searchable text.
+    '''
+    include *
+    include lib.retriever
+  }
+
+  dynamic view indexTrace {
+    title '4a · Trace — a batch of records is indexed'
+    description '''
+      The host hands over plain record collections; `SourceSpec`s decide what becomes searchable
+      text. Everything lands atomically: if any row's vector is invalid, the whole batch rolls back
+      rather than persisting rows that can never be retrieved.
+    '''
+    host -> lib.retriever 'indexCollections({ services: [...], docs: [...] })'
+    lib.retriever -> lib.salience 'expand child facts into their own nodes' {
+      notes 'A record with forty accumulated notes would embed as one averaged vector that matches nothing well — so each note becomes its own row, defaulting to incidental.'
+    }
+    lib.retriever -> embedder 'embed(all bodies) — one call for the whole batch' {
+      notes 'Skipped entirely in keyword-only mode; rows then persist with no vector and FTS carries retrieval. Wrong vector count or non-finite values abort the batch loudly.'
+    }
+    lib.retriever -> db.nodesTable 'upsert rows + embedding bytes (one transaction)'
+    lib.retriever -> db.ftsTable 'replace keyword rows (same transaction)'
+    lib.retriever -> lib.vectorIndex 'upsert normalized vectors'
+  }
+
+  dynamic view retrieveTrace {
+    title '4b · Trace — a query becomes a prompt block'
+    variant sequence
+    host -> lib.retriever 'retrieveContext("who issues tokens")'
+    lib.retriever -> db.ftsTable 'keyword leg: bm25 over stems'
+    lib.retriever -> embedder 'embed(query) — skipped with no embedder'
+    lib.retriever -> lib.vectorIndex 'vector leg: cosine nearest-neighbour'
+    lib.retriever -> lib.retriever 'fuse both rankings (RRF); force-seed verbatim-named records' {
+      notes 'A result both legs like beats one that either loves. Any record whose title appears word-for-word in the query is seeded regardless of rank.'
+    }
+    lib.retriever -> db.edgesTable 'read edges fresh; breadth-first expand every seed' {
+      notes 'One adjacency build per retrieval, shared across seeds. Neighbours carry their relation, direction, weight, and their own salience.'
+    }
+    host <- lib.retriever 'bundle: seeds + neighbourhood'
+    host -> lib.contextBuilder 'buildContext(bundle, tokenBudget)'
+    host <- lib.contextBuilder 'FACTS (authoritative) + NARRATIVE (tone-only), guaranteed ≤ ceiling' {
+      notes 'Under budget pressure: narrative trims first, then fact descriptions; a fact NAME is never dropped. Defining facts outlive incidental ones.'
+    }
+    host -> llm 'prompt + context block (beyond the library’s edge)'
+  }
+}

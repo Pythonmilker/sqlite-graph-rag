@@ -1,0 +1,19 @@
+specification {
+  element system
+  element container
+  element component
+  element datastore {
+    style { shape storage }
+  }
+  element table {
+    style { shape storage }
+  }
+  element external {
+    style { color muted }
+  }
+
+  tag planned      // design mode: exists in a spec, not in code
+  tag unresolved   // could not determine — a finding, not a guess
+  tag surprise     // unexpected structure worth the reader's attention
+  tag deprecated
+}

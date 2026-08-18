@@ -1,0 +1,238 @@
+model {
+  host = external 'Host Application' {
+    description '''
+      The product this library was extracted from. It owns everything the library deliberately
+      does not: the records, the `edges` table, the embedder (if any), the SQLite connection,
+      and the final call to the language model. The library is the retrieval middle only.
+    '''
+  }
+
+  embedder = external 'Embedder (optional)' {
+    description '''
+      Anything shaped `embed(texts) => vectors`, one vector per input — a local on-device model or a
+      hosted API. Entirely optional: with none configured, retrieval runs on keywords + graph alone,
+      as a supported mode rather than a fallback. Where this runs decides whether anything touches
+      the network; the library itself never does.
+    '''
+    metadata { file 'src/graph-rag-index.ts' }
+  }
+
+  llm = external 'Language model' {
+    description '''
+      Out of scope by design: the library stops one step short. The host takes the assembled
+      FACTS/NARRATIVE block and appends it to its own prompt.
+    '''
+  }
+
+  lib = system 'sqlite-graph-rag' {
+    description '''
+      Graph RAG inside a single SQLite file: hybrid keyword + vector retrieval fused by
+      Reciprocal Rank Fusion, expanded along a typed edge graph, assembled into a token-budgeted
+      prompt block. No server, no network calls of its own, no required embedding stack.
+    '''
+    link ../README.md 'README'
+
+    retriever = container 'GraphRagIndex' {
+      description '''
+        The engine: owns the search index schema, ingests records, and answers queries with a
+        seeds-plus-neighbourhood bundle. Works identically with or without an embedder —
+        keyword-only mode is first-class, which is why this runs on a machine with no network.
+      '''
+      link ../src/graph-rag-index.ts 'source'
+      metadata { file 'src/graph-rag-index.ts' }
+
+      indexing = component 'Indexing pipeline' {
+        description '''
+          Turns host records into index rows. `SourceSpec`s declare how: which collections, which
+          fields become the searchable text, and (opt-in) which field holds child facts that become
+          their own rows. One embedding call per batch; everything lands in one transaction:
+          node row upserted, keyword row replaced, vector upserted. A record with no usable id, or
+          an embedder returning the wrong number of vectors, fails loudly — both would otherwise
+          corrupt the index silently.
+        '''
+        metadata { file 'src/graph-rag-index.ts (indexNodes, indexCollections)' }
+      }
+
+      keywordLeg = component 'Keyword leg' {
+        description '''
+          Full-text search with word-stem matching (bm25 ranking, title weighted 10x over body).
+          The query is tokenized and OR-joined for recall; a malformed query yields no keyword
+          signal rather than an error.
+        '''
+        metadata { file 'src/graph-rag-index.ts (keywordSearch, toFtsQuery)' }
+      }
+
+      vectorLeg = component 'Vector leg' {
+        description '''
+          Embeds the query and asks the vector index for nearest neighbours by meaning.
+          Absent entirely in keyword-only mode. Results with no real similarity (orthogonal
+          vectors) are dropped rather than ranked.
+        '''
+        metadata { file 'src/graph-rag-index.ts (vectorSearch)' }
+      }
+
+      fusion = component 'RRF fusion' {
+        description '''
+          Merges the two ranked lists with Reciprocal Rank Fusion (k=60): a result both legs
+          like beats one that either loves. Produces the final ranked seed list.
+        '''
+        metadata { file 'src/graph-rag-index.ts (search)' }
+      }
+
+      nameGuard = component 'Exact-name guard' {
+        #surprise
+        description '''
+          SURPRISE: ranked retrieval can push an explicitly-named record below the cutoff, so any
+          node whose title appears verbatim in the query is force-included as a seed with infinite
+          score. Names the user typed are never dropped. Child facts are excluded here — they
+          borrow their parent's title and would flood the guaranteed slots.
+        '''
+        metadata { file 'src/graph-rag-index.ts (exactTitleSeeds)' }
+      }
+
+      expansion = component 'Graph expansion' {
+        description '''
+          Breadth-first walk from each seed over the host's edge table, to a caller-chosen depth
+          (1–2 in practice). Edges are re-read fresh on every retrieval so late-written rows are
+          seen; the adjacency map is built once per retrieval and shared across seeds. Edge weight
+          rides through untouched instead of folding into the retrieval score — relevance and
+          relatedness are different questions.
+        '''
+        metadata { file 'src/graph-rag-index.ts (buildAdjacency, expand, loadEdges)' }
+      }
+
+      reconcile = component 'Removal & reconciliation' {
+        description '''
+          Deleting is the caller's job, but the helpers live here: remove one node (and its
+          keyword row, transactionally), wipe a scope for re-embedding, and list a record's
+          currently-indexed child facts so the caller can diff them against reality — a deleted
+          fact must stop being retrievable.
+        '''
+        metadata { file 'src/graph-rag-index.ts (removeNode, clear, childNodeIdsOf)' }
+      }
+    }
+
+    vectorIndex = container 'Vector index' {
+      description '''
+        In-memory nearest-neighbour search over normalized vectors — a plain linear scan, measured
+        at 1–13ms for a personal-scale corpus (≤5k vectors). Deliberately the simplest thing that
+        is correct everywhere; the `VectorIndex` interface is the seam where a bigger corpus swaps
+        in a real ANN backend. Rebuilt from the database's stored embeddings on every construct.
+      '''
+      link ../src/vector-index.ts 'source'
+      metadata { file 'src/vector-index.ts' }
+    }
+
+    contextBuilder = container 'Context builder' {
+      description '''
+        Pure function from a retrieval bundle to a prompt block that is guaranteed to fit a token
+        ceiling regardless of corpus size. Two hard-separated sections: FACTS (authoritative,
+        regenerated every turn) and NARRATIVE (tone only, first thing trimmed). Under pressure it
+        drops descriptions before names — a name is never dropped, only its detail. Token estimates
+        deliberately over-count wide scripts (CJK) so the ceiling holds for non-Latin corpora.
+      '''
+      link ../src/context-builder.ts 'source'
+      metadata { file 'src/context-builder.ts' }
+    }
+
+    salience = container 'Salience & child facts' {
+      description '''
+        How loudly a node speaks: `defining` / `notable` / `incidental`. Stored as its own column,
+        never in the searchable text — a label in the body would match its own name in keyword
+        search, and would force a re-embed on every tier change. Also mints child-fact nodes: a
+        record's accumulated notes index as separate rows (one fact, one vector), defaulting to
+        `incidental` — remembered without being volunteered.
+      '''
+      link ../src/salience.ts 'source'
+      metadata { file 'src/salience.ts' }
+    }
+
+    prune = container 'Prune decision' {
+      #surprise
+      description '''
+        Decides which index rows outlived the record they came from (bulk regenerations strand
+        orphans — 35 measured on a real database). SURPRISE — the safety rule is the absence:
+        a record kind the caller did not enumerate is never pruned, because "I have no live ids
+        for this kind" must not read as "everything of this kind is dead". Decision only; the
+        caller runs the actual deletes.
+      '''
+      link ../src/prune.ts 'source'
+      metadata { file 'src/prune.ts' }
+    }
+
+    driver = container 'SQLite driver seam' {
+      description '''
+        A four-method database interface (exec, prepare, transaction, close) so the retrieval
+        logic never names a concrete driver. The included adapter wraps better-sqlite3; another
+        driver — mobile, WASM — is an afternoon. better-sqlite3 itself is only a dev dependency.
+      '''
+      link ../src/sqlite.ts 'source'
+      metadata { file 'src/sqlite.ts' }
+    }
+  }
+
+  db = datastore 'SQLite database file' {
+    description '''
+      One local file, shared with the host's own schema. The library creates and owns exactly two
+      tables and reads a third it does not own.
+    '''
+
+    nodesTable = table 'nodes' {
+      description '''
+        Library-owned. One row per indexed text unit: id, scope, kind, title, body, the embedding
+        as raw bytes (with the model name and dimension that produced it), and salience as its own
+        column. The salience column is added by an in-constructor migration — the library lives
+        outside the host's migration runner, so its schema changes travel with it.
+      '''
+      metadata {
+        keys 'node_id UNIQUE; scope_id indexed'
+        file 'src/graph-rag-index.ts (SCHEMA_SQL, ensureSalienceColumn)'
+      }
+    }
+
+    ftsTable = table 'nodes_fts' {
+      description '''
+        Library-owned full-text index (FTS5, porter stemming) over title and body, joined to
+        `nodes` by rowid. Replaced row-by-row inside the same transaction as each node upsert.
+      '''
+      metadata { file 'src/graph-rag-index.ts (SCHEMA_SQL)' }
+    }
+
+    edgesTable = table 'edges (host-owned)' {
+      #surprise
+      description '''
+        SURPRISE: the graph itself belongs to the HOST, not the library — rows of
+        `(scope_id, data JSON {id, sourceId, targetId, type, weight})`, read fresh on every
+        expansion and never written. The probe for this table re-checks until it appears, so a
+        host whose migrations create it late loses nothing. Malformed and wrong-shaped rows are
+        skipped, not trusted — the host owns the table, so its shape is untrusted input.
+      '''
+      metadata { file 'src/graph-rag-index.ts (loadEdges, edgeTablePresent); README.md (The edge table)' }
+    }
+  }
+
+  // Who calls what
+  host -> lib.retriever 'indexCollections / retrieveContext'
+  host -> lib.prune 'asks: which rows are dead? (then runs the deletes itself)'
+  host -> lib.contextBuilder 'buildContext(bundle, budget)'
+  host -> llm 'prompt + context block'
+
+  lib.retriever.indexing -> embedder 'embed(bodies) — one call per batch'
+  lib.retriever.vectorLeg -> embedder 'embed(query)'
+  lib.retriever.indexing -> lib.salience 'expands child facts into nodes'
+  lib.retriever.indexing -> db.nodesTable 'upserts rows + embeddings'
+  lib.retriever.indexing -> db.ftsTable 'replaces keyword rows'
+  lib.retriever.indexing -> lib.vectorIndex 'upserts vectors'
+  lib.retriever.keywordLeg -> db.ftsTable 'bm25 match'
+  lib.retriever.vectorLeg -> lib.vectorIndex 'cosine nearest-neighbour'
+  lib.retriever.fusion -> lib.retriever.keywordLeg 'ranked keyword list'
+  lib.retriever.fusion -> lib.retriever.vectorLeg 'ranked vector list'
+  lib.retriever.nameGuard -> db.nodesTable 'scans titles for verbatim mentions'
+  lib.retriever.expansion -> db.edgesTable 'reads fresh each retrieval'
+  lib.retriever.reconcile -> db.nodesTable 'deletes / wipes scope'
+  lib.retriever.reconcile -> db.ftsTable 'deletes keyword rows'
+  lib.retriever.reconcile -> lib.vectorIndex 'removes vectors'
+  lib.retriever -> lib.driver 'all SQL via the 4-method interface'
+  lib.driver -> db 'executes SQL (better-sqlite3 or any driver)'
+  lib.contextBuilder -> lib.salience 'ranks and tags lines by tier'
+}

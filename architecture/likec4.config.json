@@ -1,0 +1,5 @@
+{
+  "$schema": "https://likec4.dev/schemas/config.json",
+  "name": "sqlite-graph-rag",
+  "title": "sqlite-graph-rag — Architecture"
+}
